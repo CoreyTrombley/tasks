@@ -1,0 +1,481 @@
+#!/usr/bin/env node
+
+/**
+ * Simple task randomizer:
+ *  - `tasks add "My Task"`               → adds a new task
+ *  - `tasks list`                         → shows all tasks
+ *  - `tasks remove`                       → interactive task removal
+ *  - `tasks assign`                       → randomizes and prints assignments
+ *  - `tasks schedule`                     → generate and send weekly schedule
+ */
+
+// Load environment variables from .env file
+require('dotenv').config();
+
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
+const nodemailer = require('nodemailer');
+
+// Where we'll store your tasks
+const DATA_FILE = path.resolve(__dirname, 'tasks.json');
+// Days to assign to
+const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
+
+// Fixed Monday tasks (these won't be randomized)
+const MONDAY_TASKS = ['Application Send', 'Follow Ups','Job Search', ];
+
+// Email configuration
+const EMAIL_CONFIG = {
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: process.env.SMTP_PORT || 587,
+  secure: false,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+};
+
+// Load (or init) the JSON store
+function loadTasks() {
+  if (!fs.existsSync(DATA_FILE)) {
+    return [];
+  }
+  try {
+    const tasks = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    
+    // Ensure all tasks have the new structure with subtasks
+    return tasks.map(task => {
+      if (typeof task === 'string') {
+        // Handle old string format
+        return { text: task, subtasks: [] };
+      } else if (task.text && !task.subtasks) {
+        // Handle old object format without subtasks
+        return { ...task, subtasks: [] };
+      }
+      return task;
+    });
+  } catch (err) {
+    console.error('Error reading tasks.json:', err);
+    process.exit(1);
+  }
+}
+
+// Save the JSON store
+function saveTasks(tasks) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(tasks, null, 2));
+}
+
+// Shuffle an array in-place (Fisher–Yates)
+function shuffle(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
+}
+
+// Create readline interface for interactive input
+function createInterface() {
+  return readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+}
+
+// Generate weekly schedule
+function generateSchedule(tasks) {
+  if (tasks.length === 0) {
+    return null;
+  }
+
+  // Start with Monday tasks (fixed)
+  const assignments = {
+    'Monday': MONDAY_TASKS.map(text => ({ text, subtasks: [] }))
+  };
+
+  // Shuffle the remaining tasks
+  const shuffled = shuffle([...tasks]);
+
+  // Map them to Tuesday-Friday (wrap if more tasks than days)
+  const weekdays = ['Tuesday', 'Wednesday', 'Thursday', 'Friday'];
+  shuffled.forEach((t, i) => {
+    const day = weekdays[i % weekdays.length];
+    if (!assignments[day]) assignments[day] = [];
+    assignments[day].push(t);
+  });
+
+  return assignments;
+}
+
+// Send email with schedule
+async function sendScheduleEmail(assignments, toEmail) {
+  if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.error('❌ Email configuration missing. Set EMAIL_USER and EMAIL_PASS environment variables.');
+    return false;
+  }
+
+  if (!toEmail) {
+    console.error('❌ Recipient email not specified. Set EMAIL_TO environment variable or provide as argument.');
+    return false;
+  }
+
+  try {
+    const transporter = nodemailer.createTransport(EMAIL_CONFIG);
+    
+    // Create HTML email content
+    const weekStart = new Date();
+    weekStart.setDate(weekStart.getDate() + (1 + 7 - weekStart.getDay()) % 7); // Next Monday
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekEnd.getDate() + 6);
+
+    const dateRange = `${weekStart.toLocaleDateString()} - ${weekEnd.toLocaleDateString()}`;
+    
+    let htmlContent = `
+      <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            .header { background: #f0f0f0; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+            .day { margin-bottom: 15px; }
+            .day-title { font-weight: bold; color: #333; margin-bottom: 5px; }
+            .task { margin-left: 20px; color: #666; }
+            .subtask { margin-left: 40px; color: #888; font-size: 0.9em; }
+            .no-tasks { color: #999; font-style: italic; }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <h2>🎲 Your Weekly Task Schedule</h2>
+            <p><strong>Week of:</strong> ${dateRange}</p>
+          </div>
+    `;
+
+    DAYS.forEach(day => {
+      htmlContent += `<div class="day">`;
+      htmlContent += `<div class="day-title">${day}:</div>`;
+      if (assignments[day] && assignments[day].length > 0) {
+        assignments[day].forEach((task, idx) => {
+          htmlContent += `<div class="task">• ${task.text}</div>`;
+          if (task.subtasks && task.subtasks.length > 0) {
+            task.subtasks.forEach((subtask, subIdx) => {
+              htmlContent += `<div class="subtask">   ${subIdx + 1}. ${subtask.text}</div>`;
+            });
+          }
+        });
+      } else {
+        htmlContent += `<div class="no-tasks">(no tasks)</div>`;
+      }
+      htmlContent += `</div>`;
+    });
+
+    htmlContent += `
+        </body>
+      </html>
+    `;
+
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: toEmail,
+      subject: `📅 Weekly Task Schedule - ${dateRange}`,
+      html: htmlContent,
+      text: generateTextSchedule(assignments, dateRange)
+    };
+
+    await transporter.sendMail(mailOptions);
+    return true;
+  } catch (error) {
+    console.error('❌ Error sending email:', error.message);
+    return false;
+  }
+}
+
+// Generate plain text version of schedule
+function generateTextSchedule(assignments, dateRange) {
+  let text = `🎲 Your Weekly Task Schedule\n`;
+  text += `Week of: ${dateRange}\n\n`;
+  
+  DAYS.forEach(day => {
+    text += `${day}:\n`;
+    if (assignments[day] && assignments[day].length > 0) {
+      assignments[day].forEach((task, idx) => {
+        text += `  • ${task.text}\n`;
+        if (task.subtasks && task.subtasks.length > 0) {
+          task.subtasks.forEach((subtask, subIdx) => {
+            text += `    ${subIdx + 1}. ${subtask.text}\n`;
+          });
+        }
+      });
+    } else {
+      text += `  (no tasks)\n`;
+    }
+    text += '\n';
+  });
+  
+  return text;
+}
+
+// Interactive task removal with toggle interface
+async function removeTasks(tasks) {
+  if (tasks.length === 0) {
+    console.log('No tasks to remove. Add some with `tasks add "…"`');
+    return;
+  }
+
+  const rl = createInterface();
+  
+  console.log('\n🗑️  Task Removal Interface');
+  console.log('Select tasks to remove (space to toggle, enter to confirm):\n');
+  
+  // Create a copy of tasks with selection state
+  const taskSelections = tasks.map((task, index) => ({
+    ...task,
+    index,
+    selected: false
+  }));
+
+  // Function to display current state
+  function displayTasks() {
+    console.clear();
+    console.log('🗑️  Task Removal Interface');
+    console.log('Select tasks to remove (space to toggle, enter to confirm):\n');
+    
+    taskSelections.forEach((task, idx) => {
+      const checkbox = task.selected ? '☑️' : '☐';
+      console.log(`  ${checkbox} ${idx + 1}. ${task.text}`);
+    });
+    
+    const selectedCount = taskSelections.filter(t => t.selected).length;
+    console.log(`\nSelected: ${selectedCount}/${taskSelections.length} tasks`);
+    console.log('\nControls: Space to toggle, Enter to confirm, Ctrl+C to cancel');
+  }
+
+  // Handle key presses
+  let currentIndex = 0;
+  
+  function handleKeypress(str, key) {
+    if (key.name === 'up' && currentIndex > 0) {
+      currentIndex--;
+      displayTasks();
+    } else if (key.name === 'down' && currentIndex < taskSelections.length - 1) {
+      currentIndex++;
+      displayTasks();
+    } else if (key.name === 'space') {
+      taskSelections[currentIndex].selected = !taskSelections[currentIndex].selected;
+      displayTasks();
+    } else if (key.name === 'return') {
+      rl.close();
+      process.stdin.setRawMode(false);
+      process.stdin.resume();
+      
+      const selectedTasks = taskSelections.filter(t => t.selected);
+      if (selectedTasks.length === 0) {
+        console.log('\nNo tasks selected for removal.');
+        return;
+      }
+      
+      // Remove selected tasks
+      const remainingTasks = tasks.filter((_, index) => 
+        !taskSelections.find(t => t.index === index && t.selected)
+      );
+      
+      saveTasks(remainingTasks);
+      console.log(`\n✅ Removed ${selectedTasks.length} task(s):`);
+      selectedTasks.forEach(task => {
+        console.log(`   - ${task.text}`);
+      });
+    } else if (key.ctrl && key.name === 'c') {
+      rl.close();
+      process.stdin.setRawMode(false);
+      process.stdin.resume();
+      console.log('\n❌ Cancelled task removal.');
+    }
+  }
+
+  // Set up raw mode for key handling
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.on('data', handleKeypress);
+  
+  displayTasks();
+}
+
+// CLI entrypoint
+async function main() {
+  const [,, command, ...rest] = process.argv;
+  const tasks = loadTasks();
+
+  switch (command) {
+    case 'add': {
+      const taskText = rest.join(' ').trim();
+      if (!taskText) {
+        console.error('Please provide a task to add, e.g.:');
+        console.error('  tasks add "Water the plants"');
+        process.exit(1);
+      }
+      tasks.push({ text: taskText, subtasks: [] });
+      saveTasks(tasks);
+      console.log(`✅ Added task: "${taskText}"`);
+      break;
+    }
+
+    case 'list': {
+      if (tasks.length === 0) {
+        console.log('No tasks found. Add some with `tasks add "…"`');
+        break;
+      }
+      
+      console.log('\n📋 Current Tasks:\n');
+      tasks.forEach((task, index) => {
+        console.log(`  • ${task.text}`);
+        if (task.subtasks && task.subtasks.length > 0) {
+          task.subtasks.forEach((subtask, subIndex) => {
+            console.log(`    ${subIndex + 1}. ${subtask.text}`);
+          });
+        }
+      });
+      console.log('');
+      break;
+    }
+
+    case 'add-subtask': {
+      if (rest.length < 2) {
+        console.error('Please provide task index and subtask, e.g.:');
+        console.error('  tasks add-subtask 1 "Review linked lists"');
+        process.exit(1);
+      }
+      
+      const taskIndex = parseInt(rest[0]) - 1;
+      const subtaskText = rest.slice(1).join(' ').trim();
+      
+      if (taskIndex < 0 || taskIndex >= tasks.length) {
+        console.error('Invalid task index. Use `tasks list` to see available tasks.');
+        process.exit(1);
+      }
+      
+      if (!tasks[taskIndex].subtasks) {
+        tasks[taskIndex].subtasks = [];
+      }
+      
+      tasks[taskIndex].subtasks.push({ text: subtaskText });
+      saveTasks(tasks);
+      console.log(`✅ Added subtask to "${tasks[taskIndex].text}": "${subtaskText}"`);
+      break;
+    }
+
+    case 'remove': {
+      await removeTasks(tasks);
+      break;
+    }
+
+    case 'schedule': {
+      const toEmail = rest[0] || process.env.EMAIL_TO;
+      const assignments = generateSchedule(tasks);
+      
+      if (!assignments) {
+        console.log('No tasks to schedule. Add some with `tasks add "…"`');
+        break;
+      }
+
+      // Display schedule in console
+      console.log('\n🎲 Your Weekly Task Schedule:\n');
+      DAYS.forEach(day => {
+        console.log(`  ${day}:`);
+        if (assignments[day]) {
+          assignments[day].forEach((task, idx) => {
+            console.log(`    • ${task.text}`);
+            if (task.subtasks && task.subtasks.length > 0) {
+              task.subtasks.forEach((subtask, subIdx) => {
+                console.log(`      ${subIdx + 1}. ${subtask.text}`);
+              });
+            }
+          });
+        } else {
+          console.log('    (no tasks)');
+        }
+      });
+      console.log('');
+
+      // Send email if configured
+      if (toEmail) {
+        console.log(`📧 Sending schedule to ${toEmail}...`);
+        const success = await sendScheduleEmail(assignments, toEmail);
+        if (success) {
+          console.log('✅ Schedule sent successfully!');
+        } else {
+          console.log('❌ Failed to send schedule.');
+        }
+      } else {
+        console.log('💡 To enable email delivery, set EMAIL_TO environment variable or provide email as argument:');
+        console.log('   tasks schedule your-email@example.com');
+      }
+      break;
+    }
+
+    case 'assign':
+    case 'run': {
+      if (tasks.length === 0) {
+        console.log('No tasks to assign. Add some with `tasks add "…"`');
+        process.exit(0);
+      }
+
+      // Start with Monday tasks (fixed)
+      const assignments = {
+        'Monday': MONDAY_TASKS.map(text => ({ text, subtasks: [] }))
+      };
+
+      // Shuffle the remaining tasks
+      const shuffled = shuffle([...tasks]);
+
+      // Map them to Tuesday-Friday (wrap if more tasks than days)
+      const weekdays = ['Tuesday', 'Wednesday', 'Thursday', 'Friday'];
+      shuffled.forEach((t, i) => {
+        const day = weekdays[i % weekdays.length];
+        if (!assignments[day]) assignments[day] = [];
+        assignments[day].push(t);
+      });
+
+      // Print nicely
+      console.log('\n🎲 Your randomized task schedule:\n');
+      DAYS.forEach(day => {
+        console.log(`  ${day}:`);
+        if (assignments[day]) {
+          assignments[day].forEach((task, idx) => {
+            console.log(`    • ${task.text}`);
+            if (task.subtasks && task.subtasks.length > 0) {
+              task.subtasks.forEach((subtask, subIdx) => {
+                console.log(`      ${subIdx + 1}. ${subtask.text}`);
+              });
+            }
+          });
+        } else {
+          console.log('    (no tasks)');
+        }
+      });
+      console.log('');
+      break;
+    }
+
+    default:
+      console.log(`
+Usage:
+  tasks add "My Task"           Add a new task to your list
+  tasks add-subtask 1 "Subtask" Add a subtask to task #1
+  tasks list                    Show all current tasks
+  tasks remove                  Interactive task removal
+  tasks schedule                Generate and send weekly schedule
+  tasks assign                  Randomly assign all tasks to Mon–Fri
+
+Email Setup:
+  Set environment variables for automatic email delivery:
+  - EMAIL_USER: your-email@gmail.com
+  - EMAIL_PASS: your-app-password
+  - EMAIL_TO: recipient@example.com
+
+  Or provide email as argument: tasks schedule your-email@example.com
+`);
+      process.exit(0);
+  }
+}
+
+main(); 

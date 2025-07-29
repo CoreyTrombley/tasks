@@ -1,0 +1,17 @@
+{
+  "name": "weekly-task-scheduler",
+  "version": "1.0.0",
+  "description": "A simple weekly task randomizer with email scheduling",
+  "main": "tasks",
+  "scripts": {
+    "schedule": "node tasks schedule",
+    "install-deps": "npm install"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.7",
+    "dotenv": "^16.3.1"
+  },
+  "keywords": ["tasks", "scheduler", "weekly", "email"],
+  "author": "",
+  "license": "MIT"
+} 
